@@ -53,12 +53,12 @@ with st.sidebar:
     st.divider()
     st.header("Personfiltre")
     role_map = {
-        "Daglig leder": ["DAGL"],
-        "Styreleder": ["LEDER"],
-        "Styremedlem": ["STYRMEDL"],
-        "Varamedlem": ["VARA"],
-        "Signaturberettiget": ["SIGN"],
-        "Prokurist": ["PROK"],
+        "Daglig leder": ["DAGL", "DAGLIG LEDER", "DAGLIG_LEDER"],
+        "Styreleder": ["STYRELEDER", "LEDER"],
+        "Styremedlem": ["STYREMEDLEM", "STYRMEDL"],
+        "Varamedlem": ["VARAMEDLEM", "VARA"],
+        "Signaturberettiget": ["SIGNATUR", "SIGN"],
+        "Prokurist": ["PROKURIST", "PROK"],
     }
     role_flags = {name: st.checkbox(name, value=(name in ["Daglig leder", "Styreleder"])) for name in role_map.keys()}
     active_only = st.checkbox("Kun aktive roller", value=True)
@@ -184,34 +184,56 @@ def fetch_roles(orgnr:str):
     return None
 
 def parse_roles(payload):
+    """Returner liste av dicts med navn, rolle (UPPER), fradato, tildato.
+    Tåler at rolle/type ikke er strenger (hopper over de)."""
     rows = []
-    if not payload:
+    if not isinstance(payload, (dict, list)):
         return rows
+
     def walk(obj):
         if isinstance(obj, dict):
-            role_type = obj.get("type") or obj.get("rolletype")
+            # plukk ut kandidat for rolle/typetekst
+            role_raw = obj.get("rolle")
+            if not isinstance(role_raw, str):
+                role_raw = obj.get("type")
+            if not isinstance(role_raw, str):
+                role_raw = obj.get("rolletype")
+            role_str = role_raw if isinstance(role_raw, str) else None
+
+            # person/navn + datoer
             person = obj.get("person") or {}
             navn = person.get("navn") or obj.get("navn")
             fradato = obj.get("fradato") or obj.get("registrertDato")
             tildato = obj.get("tildato") or obj.get("avregistrertDato")
-            if navn and (role_type or obj.get("rolle")):
+
+            # bare legg til hvis vi faktisk har et navn og en ROLLE som tekst
+            if isinstance(navn, str) and role_str:
                 rows.append({
                     "navn": navn,
-                    "rolle": (obj.get("rolle") or role_type or "").upper(),
+                    "rolle": role_str.upper(),
                     "fradato": fradato,
                     "tildato": tildato,
                 })
+
+            # gå videre rekursivt
             for v in obj.values():
-                walk(v)
+                if isinstance(v, (dict, list)):
+                    walk(v)
+
         elif isinstance(obj, list):
             for v in obj:
-                walk(v)
+                if isinstance(v, (dict, list)):
+                    walk(v)
+
     walk(payload)
+
+    # dedup
     seen, out = set(), []
     for r in rows:
-        key = (r["navn"], r["rolle"], r.get("fradato"), r.get("tildato"))
+        key = (r.get("navn"), r.get("rolle"), r.get("fradato"), r.get("tildato"))
         if key not in seen:
-            seen.add(key); out.append(r)
+            seen.add(key)
+            out.append(r)
     return out
 
 # --- Kjønn (automatisk når filter != Alle) ---
