@@ -54,12 +54,13 @@ with st.sidebar:
     st.header("Personfiltre")
     role_map = {
         "Daglig leder": ["DAGL", "DAGLIG LEDER", "DAGLIG_LEDER"],
-        "Styreleder": ["STYRELEDER", "LEDER"],
-        "Styremedlem": ["STYREMEDLEM", "STYRMEDL"],
-        "Varamedlem": ["VARAMEDLEM", "VARA"],
+        "Styreleder":   ["LEDE", "STYRELEDER", "LEDER"],
+        "Styremedlem":  ["MEDL", "STYREMEDLEM", "STYRMEDL"],
+        "Varamedlem":   ["VARA", "VARAMEDLEM"],
         "Signaturberettiget": ["SIGNATUR", "SIGN"],
-        "Prokurist": ["PROKURIST", "PROK"],
+        "Prokurist":    ["PROKURIST", "PROK"],
     }
+
     role_flags = {name: st.checkbox(name, value=(name in ["Daglig leder", "Styreleder"])) for name in role_map.keys()}
     active_only = st.checkbox("Kun aktive roller", value=True)
 
@@ -184,34 +185,55 @@ def fetch_roles(orgnr: str):
             last = (str(e), url)
     return {"_ok": False, "_error": last}
 
+def _join_name(n):
+    if isinstance(n, str):
+        return n.strip()
+    if isinstance(n, dict):
+        parts = [n.get("fornavn"), n.get("mellomnavn"), n.get("etternavn")]
+        return " ".join([p for p in parts if p]).strip()
+    return None
+
+def _role_to_text_and_code(r):
+    # returnerer (tekst, kode) der minst én finnes
+    raw = r.get("rolle") or r.get("type") or r.get("rolletype")
+    if isinstance(raw, str):
+        return raw, raw  # tekst=kode=raw (best effort)
+    if isinstance(raw, dict):
+        return raw.get("beskrivelse") or raw.get("kode") or "", raw.get("kode") or ""
+    return "", ""
+
 def parse_roles(payload):
-    """Trygg parser for ulike roller-responser."""
     rows = []
     if not isinstance(payload, (dict, list)):
         return rows
 
-    # rask vei: rollegrupper -> roller
+    def add_from_r(r):
+        navn = _join_name(((r.get("person") or {}).get("navn")) or r.get("navn"))
+        tekst, kode = _role_to_text_and_code(r)
+        fradato = r.get("fradato") or r.get("registrertDato")
+        tildato = r.get("tildato") or r.get("avregistrertDato")
+        fratraadt = r.get("fratraadt")
+        if navn and (tekst or kode):
+            rows.append({
+                "navn": navn,
+                "rolle_tekst": (tekst or kode).upper(),
+                "rolle_kode": (kode or tekst).upper(),
+                "fradato": fradato,
+                "tildato": tildato,
+                "fratraadt": fratraadt,
+            })
+
+    # Hurtigvei via rollegrupper
     if isinstance(payload, dict) and "rollegrupper" in payload:
         for g in payload.get("rollegrupper") or []:
             for r in g.get("roller") or []:
-                navn = ((r.get("person") or {}).get("navn")) or r.get("navn")
-                role_raw = r.get("rolle") or r.get("type") or r.get("rolletype")
-                fradato = r.get("fradato") or r.get("registrertDato")
-                tildato = r.get("tildato") or r.get("avregistrertDato")
-                if isinstance(navn, str) and isinstance(role_raw, str):
-                    rows.append({"navn": navn, "rolle": role_raw.upper(), "fradato": fradato, "tildato": tildato})
+                add_from_r(r)
     else:
-        # generell dyp-gjennomgang
+        # Fallback: gå gjennom alt
         def walk(obj):
             if isinstance(obj, dict):
-                role_raw = obj.get("rolle") or obj.get("type") or obj.get("rolletype")
-                role_str = role_raw if isinstance(role_raw, str) else None
-                person = obj.get("person") or {}
-                navn = person.get("navn") or obj.get("navn")
-                fradato = obj.get("fradato") or obj.get("registrertDato")
-                tildato = obj.get("tildato") or obj.get("avregistrertDato")
-                if isinstance(navn, str) and role_str:
-                    rows.append({"navn": navn, "rolle": role_str.upper(), "fradato": fradato, "tildato": tildato})
+                if "person" in obj or "rolle" in obj or "rolletype" in obj or "type" in obj:
+                    add_from_r(obj)
                 for v in obj.values():
                     if isinstance(v, (dict, list)):
                         walk(v)
@@ -224,7 +246,7 @@ def parse_roles(payload):
     # dedup
     seen, out = set(), []
     for r in rows:
-        key = (r.get("navn"), r.get("rolle"), r.get("fradato"), r.get("tildato"))
+        key = (r["navn"], r["rolle_kode"], r.get("fradato"), r.get("tildato"))
         if key not in seen:
             seen.add(key); out.append(r)
     return out
@@ -304,20 +326,22 @@ if run:
                 roles = parse_roles(payload)
 
                 for rr in roles:
-                    rolle_upper = (rr.get("rolle") or "")
-                    active = not bool(rr.get("tildato"))
+                    rolle_code = (rr.get("rolle_kode") or "").upper()
+                    rolle_text = (rr.get("rolle_tekst") or rolle_code)
+                    active = (rr.get("tildato") in (None, "",)) and (rr.get("fratraadt") in (None, False))
 
-                    # Rollefilter m/garantert chosen_label
-                    chosen_label = rr.get("rolle") or "ROLLE"
+                    chosen_label = rolle_text  # fallback
                     keep = False
                     for ui_label, codes in role_map.items():
-                        if role_flags[ui_label] and any(rolle_upper.startswith(c) for c in codes):
-                            keep = True; chosen_label = ui_label; break
+                        if role_flags[ui_label] and any(rolle_code.startswith(c) for c in codes):
+                            keep = True
+                            chosen_label = ui_label
+                            break
                     if not any(role_flags.values()):
                         keep = True  # ingen kryss = ta alt
-
                     if not keep or (active_only and not active):
                         continue
+
 
                     # Kjønn-estimat kun hvis filter != Alle
                     est_gender = ""; gender_prob = None
