@@ -1,18 +1,17 @@
-# app.py — Styrekandidat-screener (persistens + profil + valgfri medieomtale)
+# app.py — Styrekandidat-screener (persistens + profil + samlet medieomtale)
 import io
 import os
 import re
+import html
 from datetime import datetime, date
 import requests
 import pandas as pd
 import streamlit as st
 
-import html
 try:
     import feedparser  # for RSS fallback
 except Exception:
     feedparser = None
-
 
 ENHETS_API = "https://data.brreg.no/enhetsregisteret/api/enheter"
 PAGE_SIZE = 200
@@ -281,98 +280,6 @@ def first_name_from_full(name:str):
     if not name: return ""
     return re.split(r"\s+", name.strip())[0]
 
-# --- Media mentions: NewsAPI -> GDELT -> RSS ---
-FEEDS = [
-    "https://www.nrk.no/toppsaker.rss",
-    "https://e24.no/rss",
-    "https://www.dn.no/rss",
-    "https://www.hegnar.no/rss",  # valgfritt
-]
-
-def search_mentions_newsapi(person_name: str, page_size: int = 8):
-    key = st.secrets.get("NEWSAPI_KEY", "")
-    if not key:
-        return []
-    url = "https://newsapi.org/v2/everything"
-    params = {
-        "q": person_name,
-        "language": "no",
-        "pageSize": page_size,
-        "sortBy": "publishedAt",
-        "apiKey": key,
-    }
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return [
-            {
-                "title": a.get("title"),
-                "url": a.get("url"),
-                "source": (a.get("source") or {}).get("name"),
-                "date": a.get("publishedAt"),
-                "source_type": "NewsAPI",
-            }
-            for a in data.get("articles", [])
-        ]
-    except Exception:
-        return []
-
-def search_mentions_gdelt(person_name: str, maxrecords: int = 8):
-    url = "https://api.gdeltproject.org/api/v2/doc/doc"
-    params = {"query": f"{person_name} sourceCountry:NO", "mode": "ArtList", "maxrecords": maxrecords, "format": "json"}
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        arts = data.get("articles", [])
-        return [
-            {
-                "title": a.get("title"),
-                "url": a.get("url"),
-                "source": a.get("sourceCommonName"),
-                "date": a.get("seendate"),
-                "source_type": "GDELT",
-            }
-            for a in arts
-        ]
-    except Exception:
-        return []
-
-def search_mentions_rss(person_name: str, limit_per_feed: int = 15):
-    if not feedparser:
-        return []
-    out = []
-    q = (person_name or "").lower()
-    try:
-        for f in FEEDS:
-            d = feedparser.parse(f)
-            src = d.feed.get("title", "")
-            for e in d.entries[:limit_per_feed]:
-                text = " ".join([e.get("title",""), html.unescape(e.get("summary",""))])
-                if q and q in text.lower():
-                    out.append({
-                        "title": e.get("title",""),
-                        "url": e.get("link",""),
-                        "source": src,
-                        "date": e.get("published","") or e.get("updated",""),
-                        "source_type": "RSS",
-                    })
-    except Exception:
-        pass
-    return out
-
-def search_mentions(person_name: str) -> list[dict]:
-    # 1) NewsAPI (hvis nøkkel finnes)  2) GDELT  3) RSS
-    res = search_mentions_newsapi(person_name)
-    if res:
-        return res
-    res = search_mentions_gdelt(person_name)
-    if res:
-        return res
-    return search_mentions_rss(person_name)
-
-
 def _parse_date(s):
     if not s: return None
     for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y-%m", "%Y"):
@@ -395,25 +302,109 @@ def _duration_human(start:date|None, end:date|None):
         return f"{years} år"
     return f"{rem_m} mnd"
 
-# --- Valgfri: medieomtale via Bing Web Search (sett BING_KEY i miljøvariabler) ---
-@st.cache_data(ttl=3600, show_spinner=False)
-def search_mentions(name:str, company:str|None=None, limit:int=5):
-    api_key = os.getenv("BING_KEY", "")
-    if not api_key:
-        return []
-    q = f'"{name}"'
-    if company:
-        q += f' AND "{company}"'
-    params = {"q": q, "count": limit, "mkt": "nb-NO", "freshness": "Month", "textDecorations": "false"}
-    headers = {"Ocp-Apim-Subscription-Key": api_key}
+# --- Media mentions: NewsAPI -> GDELT -> RSS (samler 5 nyeste) ---
+FEEDS = [
+    "https://www.nrk.no/toppsaker.rss",
+    "https://e24.no/rss",
+    "https://www.dn.no/rss",
+    "https://www.hegnar.no/rss",
+]
+
+def _try_parse_dt(s: str):
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%a, %d %b %Y %H:%M:%S %Z", "%Y-%m-%d", "%Y%m%d", "%Y-%m", "%Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:
+            continue
     try:
-        r = requests.get("https://api.bing.microsoft.com/v7.0/search", params=params, headers=headers, timeout=10)
-        if r.status_code == 200 and "application/json" in r.headers.get("content-type",""):
-            web = (r.json().get("webPages") or {}).get("value", [])
-            return [{"title": i.get("name"), "snippet": i.get("snippet"), "url": i.get("url")} for i in web]
-    except requests.RequestException:
-        pass
-    return []
+        return datetime.fromisoformat(s.replace("Z","").replace("+00:00",""))
+    except Exception:
+        return None
+
+def search_mentions_newsapi(person_name: str, page_size: int = 50):
+    key = st.secrets.get("NEWSAPI_KEY", "")
+    if not key:
+        return []
+    url = "https://newsapi.org/v2/everything"
+    params = {
+        "q": person_name,
+        "language": "no",
+        "pageSize": page_size,
+        "sortBy": "publishedAt",
+        "apiKey": key,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        out = []
+        for a in data.get("articles", []):
+            dt = _try_parse_dt(a.get("publishedAt"))
+            out.append({
+                "title": a.get("title"),
+                "url": a.get("url"),
+                "source": (a.get("source") or {}).get("name"),
+                "date": dt,
+                "source_type": "NewsAPI",
+            })
+        return out
+    except Exception:
+        return []
+
+def search_mentions_gdelt(person_name: str, maxrecords: int = 50):
+    url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    params = {"query": f'{person_name} sourceCountry:NO', "mode": "ArtList", "maxrecords": maxrecords, "format": "json"}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        out = []
+        for a in data.get("articles", []):
+            dt = _try_parse_dt(a.get("seendate"))
+            out.append({
+                "title": a.get("title"),
+                "url": a.get("url"),
+                "source": a.get("sourceCommonName"),
+                "date": dt,
+                "source_type": "GDELT",
+            })
+        return out
+    except Exception:
+        return []
+
+def search_mentions_rss(person_name: str, limit_per_feed: int = 50):
+    if not feedparser:
+        return []
+    out = []
+    q = (person_name or "").lower()
+    for f in FEEDS:
+        try:
+            d = feedparser.parse(f)
+            src = d.feed.get("title", "")
+            for e in d.entries[:limit_per_feed]:
+                text = " ".join([e.get("title",""), html.unescape(e.get("summary",""))]).lower()
+                if q and q in text:
+                    dt = _try_parse_dt(e.get("published") or e.get("updated") or "")
+                    out.append({
+                        "title": e.get("title",""),
+                        "url": e.get("link",""),
+                        "source": src,
+                        "date": dt,
+                        "source_type": "RSS",
+                    })
+        except Exception:
+            continue
+    return out
+
+def search_mentions(person_name: str) -> list[dict]:
+    items = []
+    items += search_mentions_newsapi(person_name) or []
+    items += search_mentions_gdelt(person_name) or []
+    items += search_mentions_rss(person_name) or []
+    items.sort(key=lambda x: (x.get("date") or datetime.min), reverse=True)
+    return items[:5]
 
 # --- RUN SEARCH ---
 if run:
@@ -460,7 +451,7 @@ if run:
                     rolle_text = (rr.get("rolle_tekst") or rolle_code)
                     now_active = (rr.get("tildato") in (None, "",)) and (rr.get("fratraadt") in (None, False))
 
-                    # Rollefilter
+                    # Rollefilter (inkluder ALLE hvis ingen er huket)
                     chosen_label = rolle_text
                     keep = False
                     for ui_label, codes in role_map.items():
@@ -468,6 +459,7 @@ if run:
                             keep = True; chosen_label = ui_label; break
                     if not any(role_flags.values()):
                         keep = True
+                    # Aktiv-filter
                     if not keep or (active_only and not now_active):
                         continue
 
@@ -495,6 +487,7 @@ if run:
         "sektor_priv": sektor_priv,
         "sektor_off": sektor_off,
         "gender_filter": gender_filter,
+        "active_only": bool(active_only),
         "top_n": int(top_n),
     }
     st.session_state.selected_person = "(ingen)"
@@ -503,6 +496,28 @@ if run:
 companies_top = st.session_state.companies_top
 people_df_all = st.session_state.people_df
 last = st.session_state.last_filters
+
+def build_full_profile_for_person(name: str, companies_top_df: pd.DataFrame) -> pd.DataFrame:
+    """Hent alle roller personen har i topp-selskapene (alltid komplett historikk)."""
+    rows = []
+    for _, c in (companies_top_df or pd.DataFrame()).iterrows():
+        payload = fetch_roles(str(c["orgnr"]))
+        roles = parse_roles(payload)
+        for rr in roles:
+            n = (rr.get("navn") or "").strip()
+            if n.lower() == name.strip().lower():
+                now_active = (rr.get("tildato") in (None, "",)) and (rr.get("fratraadt") in (None, False))
+                rows.append({
+                    "Rolle": rr.get("rolle_tekst") or rr.get("rolle_kode"),
+                    "Selskap": c["navn"],
+                    "Industri": c["segmenter"],
+                    "Sektor": c["sektor"],
+                    "Nåværende": bool(now_active),
+                    "_start": rr.get("fradato"),
+                    "_slutt": rr.get("tildato"),
+                    "Brreg-lenke": f"https://w2.brreg.no/enhet/sok/detalj.jsp?orgnr={c['orgnr']}",
+                })
+    return pd.DataFrame(rows)
 
 if companies_top is not None and people_df_all is not None:
     # Selskaper
@@ -547,16 +562,23 @@ if companies_top is not None and people_df_all is not None:
                            file_name="people_roles.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        # Mini-profil (forenklet selectbox: ingen dynamisk index — løser “hopper tilbake”)
+        # Mini-profil (full historikk uansett filtre)
         uniq = sorted(people_df["Navn"].dropna().unique().tolist())
         if "selected_person" not in st.session_state:
             st.session_state.selected_person = "(ingen)"
         pick = st.selectbox("Vis profil for person:", ["(ingen)"] + uniq, key="selected_person")
 
         if pick != "(ingen)":
-            prof = people_df_all[people_df_all["Navn"] == pick].copy()  # bruk ALL for full historikk
-            prof["Start_d"] = prof["_start"].apply(_parse_date)
-            prof["Slutt_d"] = prof["_slutt"].apply(_parse_date)
+            prof = build_full_profile_for_person(pick, companies_top)
+            if prof.empty:
+                # fallback: det som finnes i uttrekket
+                prof = people_df_all[people_df_all["Navn"] == pick][[
+                    "Rolle","Selskap","Industri","Sektor","Nåværende","_start","_slutt","Brreg-lenke"
+                ]].copy()
+
+            # dato/ansiennitet
+            prof["Start_d"] = prof["_start"].apply(lambda s: _parse_date(s))
+            prof["Slutt_d"] = prof["_slutt"].apply(lambda s: _parse_date(s))
             prof["Ansiennitet"] = prof.apply(lambda r: _duration_human(r["Start_d"], r["Slutt_d"]), axis=1)
 
             ant_roller = len(prof)
@@ -566,45 +588,48 @@ if companies_top is not None and people_df_all is not None:
             sektorer = sorted(prof["Sektor"].dropna().unique().tolist())
 
             st.markdown(f"**Profil – {pick}**")
-            bio_bits = []
-            bio_bits.append(f"{pick} har {ant_roller} registrerte roller i dette uttrekket ({ant_aktive} aktive).")
-            if rollelabels: bio_bits.append(f"Typiske roller: {', '.join(rollelabels)}.")
-            if bransjer: bio_bits.append(f"Bransjer: {', '.join(bransjer)}.")
-            if sektorer: bio_bits.append(f"Sektor: {', '.join(sektorer)}.")
-            st.write(" ".join(bio_bits))
+            bits = [f"{pick} har {ant_roller} registrerte roller i dette uttrekket ({ant_aktive} aktive)."]
+            if rollelabels: bits.append(f"Typiske roller: {', '.join(rollelabels)}.")
+            if bransjer: bits.append(f"Bransjer: {', '.join(bransjer)}.")
+            if sektorer: bits.append(f"Sektor: {', '.join(sektorer)}.")
+            st.write(" ".join(bits))
 
             show_prof = prof[[
                 "Rolle","Selskap","Industri","Sektor","Nåværende","_start","_slutt","Ansiennitet","Brreg-lenke"
             ]].rename(columns={"_start":"Start","_slutt":"Slutt"})
             st.dataframe(show_prof, width="stretch", hide_index=True)
 
-            # Media-treff for valgt person (fallback-kjede)
+            # Medieomtale (5 nyeste samlet)
             mentions = search_mentions(pick)
             if mentions:
-                st.markdown("**Nevnt i media:**")
+                st.markdown("**Nevnt i media (nyeste først):**")
                 for m in mentions:
                     title = m.get("title") or "(uten tittel)"
                     url = m.get("url") or ""
                     source = m.get("source") or ""
-                    date = m.get("date") or ""
+                    dt = m.get("date")
+                    date_str = dt.strftime("%Y-%m-%d") if isinstance(dt, datetime) else ""
                     src_tag = m.get("source_type")
-                    st.markdown(f"- [{title}]({url}) — {source} {('• ' + date) if date else ''}  \n  <sub>via {src_tag}</sub>", unsafe_allow_html=True)
+                    st.markdown(
+                        f"- [{title}]({url}) — {source}{(' • ' + date_str) if date_str else ''}  \n"
+                        f"  <sub>via {src_tag}</sub>",
+                        unsafe_allow_html=True
+                    )
             else:
                 st.caption("Ingen medietreff funnet (NewsAPI/GDELT/RSS).")
-
-
     else:
         st.info("Ingen personer/roller funnet i topp-selskapene.")
 
-    # Status
+    # Status (faktiske tall)
     st.markdown(
         f"**Antall selskaper vist:** {0 if companies_top is None else len(companies_top):,} • "
         f"**Antall personer vist:** {len(people_df) if 'people_df' in locals() else 0:,} • "
         f"**Sektorfilter:** "
         f"{'Privat' if last.get('sektor_priv', True) else ''}{'/' if (last.get('sektor_priv', True) and last.get('sektor_off', True)) else ''}{'Offentlig' if last.get('sektor_off', True) else ''} • "
-        f"**Kjønnsfilter:** {last.get('gender_filter','Alle')}"
+        f"**Kjønnsfilter:** {last.get('gender_filter','Alle')} • "
+        f"**Kun aktive roller:** {'Ja' if last.get('active_only', True) else 'Nei'}"
     )
 else:
     st.info("Kjør et søk fra venstremenyen for å vise resultater.")
 
-st.caption("Kilde: Enhetsregisteret (åpne data). Roller hentes best-effort fra Brreg (inkl. historikk). Kjønn estimeres fra fornavn og er usikkert. Medieomtale er valgfri og krever API-nøkkel.")
+st.caption("Kilde: Enhetsregisteret (åpne data). Roller hentes best-effort fra Brreg (inkl. historikk). Kjønn estimeres fra fornavn og er usikkert. Medieomtale er valgfri (NewsAPI/GDELT/RSS).")
