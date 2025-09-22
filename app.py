@@ -1,4 +1,4 @@
-# app.py — Styrekandidat-screener (persistens + profil + samlet medieomtale)
+# app.py — Styrekandidat-screener (persistens + profil + medieomtale, historikk-fix)
 import io
 import os
 import re
@@ -85,7 +85,13 @@ with st.sidebar:
     gender_filter = st.radio("Kjønnsfilter (estimat fra fornavn)", options=["Alle", "Dame", "Mann"], index=0, horizontal=True)
 
     st.divider()
-    run = st.button("Kjør søk", type="primary")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        run = st.button("Kjør søk", type="primary")
+    with col_b:
+        if st.button("Tøm cache"):
+            st.cache_data.clear()
+            st.experimental_rerun()
 
 # --- Helpers ---
 def kommunenummer_list_from_text(txt:str):
@@ -181,8 +187,6 @@ def normalize_enheter(payload):
 
 # --- Roller (robust + historikk) ---
 @st.cache_data(show_spinner=False)
-# --- Roller (robust + historikk) ---
-@st.cache_data(show_spinner=False)
 def fetch_roles(orgnr: str):
     attempts = [
         ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller",
@@ -229,6 +233,7 @@ def _role_to_text_and_code(r):
     return "", ""
 
 def parse_roles(payload):
+    """Trekk ut både aktive og historiske roller uansett hvor i JSON de ligger."""
     rows = []
     if not isinstance(payload, (dict, list)):
         return rows
@@ -249,31 +254,36 @@ def parse_roles(payload):
                 "fratraadt": fratraadt,
             })
 
+    # 1) Les eksplisitte rollegrupper (typisk aktive)
     if isinstance(payload, dict) and "rollegrupper" in payload:
         for g in payload.get("rollegrupper") or []:
             for r in g.get("roller") or []:
                 add_from_r(r)
-    else:
-        def walk(obj):
-            if isinstance(obj, dict):
-                if "person" in obj or "rolle" in obj or "rolletype" in obj or "type" in obj:
-                    add_from_r(obj)
-                for v in obj.values():
-                    if isinstance(v, (dict, list)):
-                        walk(v)
-            elif isinstance(obj, list):
-                for v in obj:
-                    if isinstance(v, (dict, list)):
-                        walk(v)
-        walk(payload)
 
+    # 2) Skann hele payload for alt som *kan* se ut som roller (inkl. historikkfelter)
+    def walk(obj):
+        if isinstance(obj, dict):
+            # nøkler som ofte rommer historikk
+            for key in ("historikk", "historiskeRoller", "tidligereRoller", "roller", "rolle", "rolletype", "type"):
+                if key in obj:
+                    add_from_r(obj)
+                    break
+            for v in obj.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(obj, list):
+            for v in obj:
+                if isinstance(v, (dict, list)):
+                    walk(v)
+    walk(payload)
+
+    # dedup
     seen, out = set(), []
     for r in rows:
         key = (r["navn"], r["rolle_kode"], r.get("fradato"), r.get("tildato"))
         if key not in seen:
             seen.add(key); out.append(r)
     return out
-
 
 # --- Kjønn (alltid vist; filter valgfritt) ---
 @st.cache_data(show_spinner=False)
@@ -456,7 +466,7 @@ if run:
     else:
         companies_top = pd.DataFrame()
 
-    # Roller -> personer
+    # Roller -> personer (ALLTID hent alle roller; filtrer 'aktive' etterpå basert på active_only)
     people_rows = []
     if not companies_top.empty:
         with st.spinner("Henter roller for topp-selskap..."):
@@ -466,7 +476,7 @@ if run:
                 for rr in roles:
                     rolle_code = (rr.get("rolle_kode") or "").upper()
                     rolle_text = (rr.get("rolle_tekst") or rolle_code)
-                    now_active = (rr.get("tildato") in (None, "",)) and (rr.get("fratraadt") in (None, False))
+                    now_active = is_now_active(rr)
 
                     # Rollefilter (inkluder ALLE hvis ingen er huket)
                     chosen_label = rolle_text
@@ -476,8 +486,11 @@ if run:
                             keep = True; chosen_label = ui_label; break
                     if not any(role_flags.values()):
                         keep = True
-                    # Aktiv-filter
-                    if not keep or (active_only and not now_active):
+                    if not keep:
+                        continue
+
+                    # Aktiv-filter (GJØRES NÅ, etter at alle roller er hentet)
+                    if active_only and not now_active:
                         continue
 
                     kjonn = genderize(first_name_from_full(rr.get("navn", "")))
@@ -516,7 +529,6 @@ last = st.session_state.last_filters
 
 def build_full_profile_for_person(name: str, companies_top_df: pd.DataFrame) -> pd.DataFrame:
     """Hent alle roller personen har i topp-selskapene (alltid komplett historikk)."""
-    # Robust håndtering av None / tom DF
     if not isinstance(companies_top_df, pd.DataFrame) or companies_top_df.empty:
         return pd.DataFrame()
 
@@ -527,7 +539,7 @@ def build_full_profile_for_person(name: str, companies_top_df: pd.DataFrame) -> 
         for rr in roles:
             n = (rr.get("navn") or "").strip()
             if n.lower() == name.strip().lower():
-                now_active = (rr.get("tildato") in (None, "",)) and (rr.get("fratraadt") in (None, False))
+                now_active = is_now_active(rr)
                 rows.append({
                     "Rolle": rr.get("rolle_tekst") or rr.get("rolle_kode"),
                     "Selskap": c["navn"],
@@ -592,14 +604,13 @@ if companies_top is not None and people_df_all is not None:
         if pick != "(ingen)":
             prof = build_full_profile_for_person(pick, companies_top)
             if prof.empty:
-                # fallback: det som finnes i uttrekket
                 prof = people_df_all[people_df_all["Navn"] == pick][[
                     "Rolle","Selskap","Industri","Sektor","Nåværende","_start","_slutt","Brreg-lenke"
                 ]].copy()
 
             # dato/ansiennitet
-            prof["Start_d"] = prof["_start"].apply(lambda s: _parse_date(s))
-            prof["Slutt_d"] = prof["_slutt"].apply(lambda s: _parse_date(s))
+            prof["Start_d"] = prof["_start"].apply(_parse_date)
+            prof["Slutt_d"] = prof["_slutt"].apply(_parse_date)
             prof["Ansiennitet"] = prof.apply(lambda r: _duration_human(r["Start_d"], r["Slutt_d"]), axis=1)
 
             ant_roller = len(prof)
