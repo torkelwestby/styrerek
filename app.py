@@ -1,5 +1,6 @@
-# app.py — Styrekandidat-screener (persistens + profil)
+# app.py — Styrekandidat-screener (persistens + profil + valgfri medieomtale)
 import io
+import os
 import re
 from datetime import datetime, date
 import requests
@@ -36,13 +37,14 @@ FYLKE_PREFIKS = {
     "Trøndelag": "50", "Nordland": "18", "Troms": "19", "Finnmark": "20", "Buskerud": "33",
 }
 
-# init session state
-for k, v in {
+# --- Session state init ---
+defaults = {
     "companies_top": None,
     "people_df": None,
     "last_filters": {},
     "selected_person": "(ingen)",
-}.items():
+}
+for k, v in defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -179,15 +181,13 @@ def fetch_roles(orgnr: str):
         ("https://data.brreg.no/enhetsregisteret/api/roller/organisasjonsnummer/{orgnr}", None),
         ("https://data.brreg.no/enhetsregisteret/api/roller/enheter/{orgnr}", None),
     ]
-    last = None
     for url, params in attempts:
         try:
             r = requests.get(url.format(orgnr=orgnr), params=params or {}, timeout=TIMEOUT, headers={"Accept": "application/json"})
             if r.status_code == 200 and "application/json" in r.headers.get("content-type", ""):
                 return r.json()
-            last = (r.status_code, r.url)
-        except requests.RequestException as e:
-            last = (str(e), url)
+        except requests.RequestException:
+            pass
     return None
 
 def _join_name(n):
@@ -296,6 +296,26 @@ def _duration_human(start:date|None, end:date|None):
         return f"{years} år"
     return f"{rem_m} mnd"
 
+# --- Valgfri: medieomtale via Bing Web Search (sett BING_KEY i miljøvariabler) ---
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_mentions(name:str, company:str|None=None, limit:int=5):
+    api_key = os.getenv("BING_KEY", "")
+    if not api_key:
+        return []
+    q = f'"{name}"'
+    if company:
+        q += f' AND "{company}"'
+    params = {"q": q, "count": limit, "mkt": "nb-NO", "freshness": "Month", "textDecorations": "false"}
+    headers = {"Ocp-Apim-Subscription-Key": api_key}
+    try:
+        r = requests.get("https://api.bing.microsoft.com/v7.0/search", params=params, headers=headers, timeout=10)
+        if r.status_code == 200 and "application/json" in r.headers.get("content-type",""):
+            web = (r.json().get("webPages") or {}).get("value", [])
+            return [{"title": i.get("name"), "snippet": i.get("snippet"), "url": i.get("url")} for i in web]
+    except requests.RequestException:
+        pass
+    return []
+
 # --- RUN SEARCH ---
 if run:
     kommunenr_manual = kommunenummer_list_from_text(kommunenr_raw)
@@ -369,7 +389,7 @@ if run:
 
     people_df_all = pd.DataFrame(people_rows)
 
-    # Lagre i session_state
+    # Lagre i session_state og reset valgt person
     st.session_state.companies_top = companies_top
     st.session_state.people_df = people_df_all
     st.session_state.last_filters = {
@@ -378,7 +398,6 @@ if run:
         "gender_filter": gender_filter,
         "top_n": int(top_n),
     }
-    # reset valgt person når nytt søk kjøres
     st.session_state.selected_person = "(ingen)"
 
 # --- RENDER (bruk session_state hvis data finnes) ---
@@ -429,13 +448,14 @@ if companies_top is not None and people_df_all is not None:
                            file_name="people_roles.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        # Mini-profil
+        # Mini-profil (forenklet selectbox: ingen dynamisk index — løser “hopper tilbake”)
         uniq = sorted(people_df["Navn"].dropna().unique().tolist())
-        pick = st.selectbox("Vis profil for person:", options=["(ingen)"] + uniq,
-                            index=(["(ingen)"]+uniq).index(st.session_state.selected_person) if st.session_state.selected_person in ["(ingen)"]+uniq else 0,
-                            key="selected_person")
+        if "selected_person" not in st.session_state:
+            st.session_state.selected_person = "(ingen)"
+        pick = st.selectbox("Vis profil for person:", ["(ingen)"] + uniq, key="selected_person")
+
         if pick != "(ingen)":
-            prof = people_df_all[people_df_all["Navn"] == pick].copy()  # bruk ALL (ikke kjønnsfiltrert) for full historikk
+            prof = people_df_all[people_df_all["Navn"] == pick].copy()  # bruk ALL for full historikk
             prof["Start_d"] = prof["_start"].apply(_parse_date)
             prof["Slutt_d"] = prof["_slutt"].apply(_parse_date)
             prof["Ansiennitet"] = prof.apply(lambda r: _duration_human(r["Start_d"], r["Slutt_d"]), axis=1)
@@ -446,21 +466,27 @@ if companies_top is not None and people_df_all is not None:
             bransjer = sorted({b for s in prof["Industri"].fillna("").tolist() for b in (s.split(", ") if s else []) if b})
             sektorer = sorted(prof["Sektor"].dropna().unique().tolist())
 
-            bio_lines = [
-                f"{pick} har {ant_roller} registrerte roller i dette uttrekket ({ant_aktive} aktive).",
-                f"Typiske roller: {', '.join(rollelabels)}." if rollelabels else "",
-                f"Bransjer: {', '.join(bransjer)}." if bransjer else "",
-                f"Sektor: {', '.join(sektorer)}." if sektorer else "",
-            ]
-            bio = " ".join([s for s in bio_lines if s])
             st.markdown(f"**Profil – {pick}**")
-            if bio:
-                st.write(bio)
+            bio_bits = []
+            bio_bits.append(f"{pick} har {ant_roller} registrerte roller i dette uttrekket ({ant_aktive} aktive).")
+            if rollelabels: bio_bits.append(f"Typiske roller: {', '.join(rollelabels)}.")
+            if bransjer: bio_bits.append(f"Bransjer: {', '.join(bransjer)}.")
+            if sektorer: bio_bits.append(f"Sektor: {', '.join(sektorer)}.")
+            st.write(" ".join(bio_bits))
 
             show_prof = prof[[
                 "Rolle","Selskap","Industri","Sektor","Nåværende","_start","_slutt","Ansiennitet","Brreg-lenke"
             ]].rename(columns={"_start":"Start","_slutt":"Slutt"})
             st.dataframe(show_prof, width="stretch", hide_index=True)
+
+            # Valgfri medieomtale (kun hvis BING_KEY er satt)
+            hits = search_mentions(pick, company=prof["Selskap"].iloc[0] if not prof.empty else None, limit=5)
+            with st.expander("Medieomtale (siste mnd)", expanded=False):
+                if hits:
+                    for h in hits:
+                        st.markdown(f"- [{h['title']}]({h['url']}) — {h['snippet']}")
+                else:
+                    st.caption("Legg til en miljøvariabel BING_KEY for å aktivere enkle web-treff (eller ingen treff funnet).")
     else:
         st.info("Ingen personer/roller funnet i topp-selskapene.")
 
@@ -475,4 +501,4 @@ if companies_top is not None and people_df_all is not None:
 else:
     st.info("Kjør et søk fra venstremenyen for å vise resultater.")
 
-st.caption("Kilde: Enhetsregisteret (åpne data). Roller hentes best-effort fra Brreg (inkl. historikk). Kjønn estimeres fra fornavn og er usikkert.")
+st.caption("Kilde: Enhetsregisteret (åpne data). Roller hentes best-effort fra Brreg (inkl. historikk). Kjønn estimeres fra fornavn og er usikkert. Medieomtale er valgfri og krever API-nøkkel.")
