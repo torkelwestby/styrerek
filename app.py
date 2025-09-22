@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 ENHETS_API = "https://data.brreg.no/enhetsregisteret/api/enheter"
-PAGE_SIZE = 500
+PAGE_SIZE = 200
 TIMEOUT = 30
 
 st.set_page_config(page_title="Styrekandidat-screener", layout="wide")
@@ -111,12 +111,36 @@ def pass_sector_filter_row(row, priv, off):
 
 @st.cache_data(show_spinner=False)
 def fetch_enheter(page:int, size:int, kommunenummer_list):
-    params = {"page": page, "size": size, "sort": "antallAnsatte,desc"}
-    if kommunenummer_list:
-        params["kommunenummer"] = ",".join(kommunenummer_list)
-    r = requests.get(ENHETS_API, params=params, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+    # prøv (sort+size), så (uten sort), så med size=200
+    attempts = [
+        {"sort": "antallAnsatte,desc", "size": size},
+        {"sort": None,                   "size": size},
+        {"sort": "antallAnsatte,desc",  "size": 200},
+        {"sort": None,                  "size": 200},
+    ]
+    last_err = None
+    for a in attempts:
+        params = {"page": page, "size": a["size"]}
+        if kommunenummer_list:
+            params["kommunenummer"] = ",".join(kommunenummer_list)
+        if a["sort"]:
+            params["sort"] = a["sort"]
+        try:
+            r = requests.get(ENHETS_API, params=params, timeout=TIMEOUT)
+            if r.status_code == 200 and "application/json" in r.headers.get("content-type",""):
+                return r.json()
+            last_err = (r.status_code, r.url, r.text[:800])
+        except requests.RequestException as e:
+            last_err = (str(e), None, None)
+
+    # vis nyttig feilmelding i UI og stopp
+    code, url, body = last_err if isinstance(last_err, tuple) else (None, None, None)
+    st.error("Brreg-API avviste kallene. Sjekk detaljer under.")
+    if url: st.code(f"URL: {url}")
+    if code: st.code(f"Status: {code}")
+    if body: st.code(body)
+    st.stop()
+
 
 def normalize_enheter(payload):
     out = []
