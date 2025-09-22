@@ -183,14 +183,23 @@ def normalize_enheter(payload):
 @st.cache_data(show_spinner=False)
 def fetch_roles(orgnr: str):
     attempts = [
+        # Samme endepunkt, flere mulige parameternavn for historikk
         ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller", {"includeHistorikk": "true"}),
-        ("https://data.brreg.no/enhetsregisteret/api/roller/organisasjonsnummer/{orgnr}", None),
-        ("https://data.brreg.no/enhetsregisteret/api/roller/enheter/{orgnr}", None),
+        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller", {"inkluderHistorikk": "true"}),
+        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller", {"historikk": "true"}),
+        # Alternative (eldre) ruter
+        ("https://data.brreg.no/enhetsregisteret/api/roller/organisasjonsnummer/{orgnr}", {"inkluderHistorikk": "true"}),
+        ("https://data.brreg.no/enhetsregisteret/api/roller/enheter/{orgnr}", {"inkluderHistorikk": "true"}),
     ]
     for url, params in attempts:
         try:
-            r = requests.get(url.format(orgnr=orgnr), params=params or {}, timeout=TIMEOUT, headers={"Accept": "application/json"})
-            if r.status_code == 200 and "application/json" in r.headers.get("content-type", ""):
+            r = requests.get(
+                url.format(orgnr=orgnr),
+                params=params,
+                timeout=TIMEOUT,
+                headers={"Accept": "application/json"}
+            )
+            if r.status_code == 200 and "application/json" in r.headers.get("content-type",""):
                 return r.json()
         except requests.RequestException:
             pass
