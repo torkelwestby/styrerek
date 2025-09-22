@@ -11,8 +11,8 @@ ENHETS_API = "https://data.brreg.no/enhetsregisteret/api/enheter"
 PAGE_SIZE = 200  # fast mot API
 TIMEOUT = 30
 
-st.set_page_config(page_title="Firmify – Styrekandidat-finner", layout="wide")
-st.title("Firmify – Styrekandidat-finner")
+st.set_page_config(page_title="Styrekandidat-screener", layout="wide")
+st.title("Styrekandidat-screener")
 
 # ---------------- NACE segmenter ----------------
 TECH = ["62", "63"]
