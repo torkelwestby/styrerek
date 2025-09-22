@@ -1,6 +1,7 @@
-# app.py — Styrekandidat-screener (robust roller + debug)
+# app.py — Styrekandidat-screener (profilvisning + enkel bio)
 import io
 import re
+from datetime import datetime, date
 import requests
 import pandas as pd
 import streamlit as st
@@ -60,14 +61,10 @@ with st.sidebar:
         "Signaturberettiget": ["SIGNATUR", "SIGN"],
         "Prokurist":    ["PROKURIST", "PROK"],
     }
-
     role_flags = {name: st.checkbox(name, value=(name in ["Daglig leder", "Styreleder"])) for name in role_map.keys()}
     active_only = st.checkbox("Kun aktive roller", value=True)
 
-    gender_filter = st.selectbox("Filtrer kjønn (estimat fra fornavn)", options=["Alle", "Kvinne", "Mann", "Ukjent"], index=0)
-
-    st.divider()
-    DEBUG_ROLES = st.checkbox("Diagnostikk: vis første rolle-JSON/feil", value=False)
+    gender_filter = st.radio("Kjønnsfilter (estimat fra fornavn)", options=["Alle", "Dame", "Mann"], index=0, horizontal=True)
 
     st.divider()
     run = st.button("Kjør søk", type="primary")
@@ -114,7 +111,6 @@ def pass_sector_filter_row(row, priv, off):
 
 @st.cache_data(show_spinner=False)
 def fetch_enheter(page:int, size:int, kommunenummer_list):
-    # prøv (sort+size), så (uten sort), så med size=200
     attempts = [
         {"sort": "antallAnsatte,desc", "size": size},
         {"sort": None,                  "size": size},
@@ -129,7 +125,7 @@ def fetch_enheter(page:int, size:int, kommunenummer_list):
         if a["sort"]:
             params["sort"] = a["sort"]
         try:
-            r = requests.get(ENHETS_API, params=params, timeout=TIMEOUT)
+            r = requests.get(ENHETS_API, params=params, timeout=TIMEOUT, headers={"Accept":"application/json"})
             if r.status_code == 200 and "application/json" in r.headers.get("content-type",""):
                 return r.json()
             last_err = (r.status_code, r.url, r.text[:800])
@@ -179,11 +175,11 @@ def fetch_roles(orgnr: str):
         try:
             r = requests.get(url.format(orgnr=orgnr), params=params or {}, timeout=TIMEOUT, headers={"Accept": "application/json"})
             if r.status_code == 200 and "application/json" in r.headers.get("content-type", ""):
-                return {"_ok": True, "data": r.json(), "_url": r.url}
+                return r.json()
             last = (r.status_code, r.url)
         except requests.RequestException as e:
             last = (str(e), url)
-    return {"_ok": False, "_error": last}
+    return None
 
 def _join_name(n):
     if isinstance(n, str):
@@ -194,10 +190,9 @@ def _join_name(n):
     return None
 
 def _role_to_text_and_code(r):
-    # returnerer (tekst, kode) der minst én finnes
     raw = r.get("rolle") or r.get("type") or r.get("rolletype")
     if isinstance(raw, str):
-        return raw, raw  # tekst=kode=raw (best effort)
+        return raw, raw
     if isinstance(raw, dict):
         return raw.get("beskrivelse") or raw.get("kode") or "", raw.get("kode") or ""
     return "", ""
@@ -223,13 +218,11 @@ def parse_roles(payload):
                 "fratraadt": fratraadt,
             })
 
-    # Hurtigvei via rollegrupper
     if isinstance(payload, dict) and "rollegrupper" in payload:
         for g in payload.get("rollegrupper") or []:
             for r in g.get("roller") or []:
                 add_from_r(r)
     else:
-        # Fallback: gå gjennom alt
         def walk(obj):
             if isinstance(obj, dict):
                 if "person" in obj or "rolle" in obj or "rolletype" in obj or "type" in obj:
@@ -243,7 +236,6 @@ def parse_roles(payload):
                         walk(v)
         walk(payload)
 
-    # dedup
     seen, out = set(), []
     for r in rows:
         key = (r["navn"], r["rolle_kode"], r.get("fradato"), r.get("tildato"))
@@ -251,30 +243,57 @@ def parse_roles(payload):
             seen.add(key); out.append(r)
     return out
 
-# --- Kjønn (automatisk når filter != Alle) ---
+# --- Kjønn (alltid vist; filter valgfritt) ---
 @st.cache_data(show_spinner=False)
 def genderize(first_name:str):
+    if not first_name:
+        return "Ukjent"
     try:
         resp = requests.get("https://api.genderize.io", params={"name": first_name}, timeout=10)
         if resp.status_code == 200 and "application/json" in resp.headers.get("content-type",""):
             data = resp.json()
-            gen = data.get("gender"); prob = data.get("probability")
-            if gen in ("male", "female"):
-                return ("Mann" if gen == "male" else "Kvinne", prob)
+            gen = data.get("gender")
+            if gen == "male":
+                return "Mann"
+            if gen == "female":
+                return "Dame"
     except requests.RequestException:
         pass
-    return ("Ukjent", None)
+    return "Ukjent"
 
 def first_name_from_full(name:str):
     if not name: return ""
     return re.split(r"\s+", name.strip())[0]
+
+# --- Datohjelpere for profil ---
+def _parse_date(s):
+    if not s: return None
+    for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y-%m", "%Y"):
+        try:
+            return datetime.strptime(str(s), fmt).date()
+        except Exception:
+            continue
+    return None
+
+def _duration_human(start:date|None, end:date|None):
+    if not start: return ""
+    end = end or date.today()
+    months = (end.year - start.year) * 12 + (end.month - start.month)
+    if months < 0: months = 0
+    years = months // 12
+    rem_m = months % 12
+    if years and rem_m:
+        return f"{years} år {rem_m} mnd"
+    if years:
+        return f"{years} år"
+    return f"{rem_m} mnd"
 
 # --- Run ---
 if run:
     kommunenr_manual = kommunenummer_list_from_text(kommunenr_raw)
     fylkepref = FYLKE_PREFIKS.get(fylke) if fylke != "(ingen)" else None
 
-    # Hent selskaper (med fallback på sort/size i fetch_enheter)
+    # Hent selskaper
     all_pages = []
     page = 0
     total = None
@@ -307,29 +326,19 @@ if run:
 
     # Roller -> personer
     people_rows = []
-    showed_debug = False
     if not companies_top.empty:
         with st.spinner("Henter roller for topp-selskap..."):
             for _, row in companies_top.iterrows():
                 orgnr = str(row["orgnr"])
-                rp = fetch_roles(orgnr)
-
-                if DEBUG_ROLES and not showed_debug:
-                    showed_debug = True
-                    if rp.get("_ok"):
-                        st.info(f"Debug: rolle-JSON for orgnr {orgnr}")
-                        st.json(rp["data"])
-                    else:
-                        st.warning(f"Rolle-endepunkt feilet for {orgnr}: {rp.get('_error')}")
-
-                payload = rp["data"] if rp.get("_ok") else {}
+                payload = fetch_roles(orgnr)
                 roles = parse_roles(payload)
 
                 for rr in roles:
                     rolle_code = (rr.get("rolle_kode") or "").upper()
                     rolle_text = (rr.get("rolle_tekst") or rolle_code)
-                    active = (rr.get("tildato") in (None, "",)) and (rr.get("fratraadt") in (None, False))
+                    now_active = (rr.get("tildato") in (None, "",)) and (rr.get("fratraadt") in (None, False))
 
+                    # Rollefilter
                     chosen_label = rolle_text  # fallback
                     keep = False
                     for ui_label, codes in role_map.items():
@@ -339,39 +348,34 @@ if run:
                             break
                     if not any(role_flags.values()):
                         keep = True  # ingen kryss = ta alt
-                    if not keep or (active_only and not active):
+                    if not keep or (active_only and not now_active):
                         continue
 
-
-                    # Kjønn-estimat kun hvis filter != Alle
-                    est_gender = ""; gender_prob = None
-                    if gender_filter != "Alle":
-                        first = first_name_from_full(rr.get("navn", ""))
-                        kjonn, prob = genderize(first)
-                        est_gender, gender_prob = kjonn, prob
-                        target = {"Kvinne":"Kvinne","Mann":"Mann","Ukjent":"Ukjent"}[gender_filter]
-                        if kjonn != target:
-                            continue
+                    # Kjønn-estimat (alltid vist)
+                    kjonn = genderize(first_name_from_full(rr.get("navn", "")))
+                    # Filter hvis valgt
+                    if gender_filter != "Alle" and kjonn != gender_filter:
+                        continue
 
                     people_rows.append({
                         "Navn": rr.get("navn"),
-                        "Estimert kjønn": est_gender,
-                        "Kjønn sannsynlighet": gender_prob,
+                        "Kjønn": kjonn,
                         "Rolle": chosen_label,
                         "Selskap": row["navn"],
-                        "Orgnr": orgnr,
                         "Ansatte": row["ansatte"],
                         "Industri": row["segmenter"],
                         "Sektor": row["sektor"],
-                        "Start": rr.get("fradato"),
-                        "Slutt": rr.get("tildato"),
+                        "Nåværende": bool(now_active),
+                        # beholder rådatoer skjult for profil-beregning:
+                        "_start": rr.get("fradato"),
+                        "_slutt": rr.get("tildato"),
                         "Brreg-lenke": f"https://w2.brreg.no/enhet/sok/detalj.jsp?orgnr={orgnr}",
                     })
 
     people_df = pd.DataFrame(people_rows)
 
     # --- Output: Selskaper ---
-    st.subheader("Selskaper (topp N)")
+    st.subheader("Selskaper")
     if not companies_top.empty:
         out_companies = companies_top[["navn","orgnr","kommune","ansatte","segmenter","sektor","hjemmeside"]].rename(columns={
             "navn":"Selskapsnavn","orgnr":"Orgnr","kommune":"Kommune","ansatte":"Ansatte",
@@ -392,25 +396,68 @@ if run:
     # --- Output: Personer ---
     st.subheader("Personer (roller i topp-selskap)")
     if not people_df.empty:
-        if gender_filter != "Alle":
-            st.caption("Merk: Kjønn er estimert fra fornavn (usikkert).")
-        st.dataframe(people_df, width="stretch", hide_index=True)
-        st.download_button("⬇️ Last ned personer (CSV)", data=people_df.to_csv(index=False).encode("utf-8"),
+        # Vis tabell
+        visible_people = people_df.drop(columns=["_start","_slutt"], errors="ignore")
+        st.dataframe(visible_people, width="stretch", hide_index=True)
+
+        # Nedlasting
+        st.download_button("⬇️ Last ned personer (CSV)", data=visible_people.to_csv(index=False).encode("utf-8"),
                            file_name="people_roles.csv", mime="text/csv")
         xbuf2 = io.BytesIO()
         with pd.ExcelWriter(xbuf2, engine="xlsxwriter") as w:
-            people_df.to_excel(w, index=False, sheet_name="Personer")
+            visible_people.to_excel(w, index=False, sheet_name="Personer")
         st.download_button("⬇️ Last ned personer (XLSX)", data=xbuf2.getvalue(),
                            file_name="people_roles.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        # --- Mini-profil for valgt person (fra dette uttrekket) ---
+        uniq = sorted(people_df["Navn"].dropna().unique().tolist())
+        pick = st.selectbox("Vis profil for person:", options=["(ingen)"] + uniq, index=0)
+        if pick != "(ingen)":
+            prof = people_df[people_df["Navn"] == pick].copy()
+
+            # beregn ansiennitet pr. rad
+            prof["Start_d"] = prof["_start"].apply(_parse_date)
+            prof["Slutt_d"] = prof["_slutt"].apply(_parse_date)
+            prof["Ansiennitet"] = prof.apply(lambda r: _duration_human(r["Start_d"], r["Slutt_d"]), axis=1)
+
+            # sammendrag
+            ant_roller = len(prof)
+            ant_aktive = int(prof["Nåværende"].sum())
+            selskaper = sorted(prof["Selskap"].dropna().unique().tolist())
+            bransjer = sorted({b for s in prof["Industri"].fillna("").tolist() for b in (s.split(", ") if s else []) if b})
+            sektorer = sorted(prof["Sektor"].dropna().unique().tolist())
+
+            # enkel bio (deterministisk, ingen LLM)
+            rollelabels = sorted(prof["Rolle"].dropna().unique().tolist())
+            bio_lines = [
+                f"{pick} har {ant_roller} registrerte roller i dette uttrekket ({ant_aktive} aktive).",
+                f"Typiske roller: {', '.join(rollelabels)}." if rollelabels else "",
+                f"Bransjer: {', '.join(bransjer)}." if bransjer else "",
+                f"Sektor: {', '.join(sektorer)}." if sektorer else "",
+            ]
+            bio = " ".join([s for s in bio_lines if s])
+
+            st.markdown(f"**Profil – {pick}**")
+            if bio:
+                st.write(bio)
+
+            # rolle-tabell (kompakt)
+            show_prof = prof[[
+                "Rolle","Selskap","Industri","Sektor","Nåværende","_start","_slutt","Ansiennitet","Brreg-lenke"
+            ]].rename(columns={"_start":"Start", "_slutt":"Slutt"})
+            st.dataframe(show_prof, width="stretch", hide_index=True)
+
     else:
         st.info("Ingen personer/roller funnet i topp-selskapene.")
 
-    # --- Status ---
+    # --- Status (faktiske tall) ---
     st.markdown(
-        f"**Topp N:** {top_n} • **Sektorfilter:** "
+        f"**Antall selskaper vist:** {len(companies_top):,} • "
+        f"**Antall personer vist:** {len(people_df):,} • "
+        f"**Sektorfilter:** "
         f"{'Privat' if sektor_priv else ''}{'/' if (sektor_priv and sektor_off) else ''}{'Offentlig' if sektor_off else ''} • "
         f"**Kjønnsfilter:** {gender_filter}"
     )
 
-st.caption("Kilde: Enhetsregisteret (åpne data). Roller hentes best-effort fra Brreg (inkl. historikk). Kjønn estimeres kun ved aktivt filter og er usikkert.")
+st.caption("Kilde: Enhetsregisteret (åpne data). Roller hentes best-effort fra Brreg (inkl. historikk). Kjønn estimeres fra fornavn og er usikkert.")
