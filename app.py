@@ -499,8 +499,12 @@ last = st.session_state.last_filters
 
 def build_full_profile_for_person(name: str, companies_top_df: pd.DataFrame) -> pd.DataFrame:
     """Hent alle roller personen har i topp-selskapene (alltid komplett historikk)."""
+    # Robust håndtering av None / tom DF
+    if not isinstance(companies_top_df, pd.DataFrame) or companies_top_df.empty:
+        return pd.DataFrame()
+
     rows = []
-    for _, c in (companies_top_df or pd.DataFrame()).iterrows():
+    for _, c in companies_top_df.iterrows():
         payload = fetch_roles(str(c["orgnr"]))
         roles = parse_roles(payload)
         for rr in roles:
