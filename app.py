@@ -1,4 +1,4 @@
-# app.py — Styrekandidat-screener (raskere + enklere filtre)
+# app.py — Styrekandidat-screener (robust roller + debug)
 import io
 import re
 import requests
@@ -63,8 +63,10 @@ with st.sidebar:
     role_flags = {name: st.checkbox(name, value=(name in ["Daglig leder", "Styreleder"])) for name in role_map.keys()}
     active_only = st.checkbox("Kun aktive roller", value=True)
 
-    # Kjønn: valg skrur estimering automatisk på
     gender_filter = st.selectbox("Filtrer kjønn (estimat fra fornavn)", options=["Alle", "Kvinne", "Mann", "Ukjent"], index=0)
+
+    st.divider()
+    DEBUG_ROLES = st.checkbox("Diagnostikk: vis første rolle-JSON/feil", value=False)
 
     st.divider()
     run = st.button("Kjør søk", type="primary")
@@ -114,7 +116,7 @@ def fetch_enheter(page:int, size:int, kommunenummer_list):
     # prøv (sort+size), så (uten sort), så med size=200
     attempts = [
         {"sort": "antallAnsatte,desc", "size": size},
-        {"sort": None,                   "size": size},
+        {"sort": None,                  "size": size},
         {"sort": "antallAnsatte,desc",  "size": 200},
         {"sort": None,                  "size": 200},
     ]
@@ -133,14 +135,12 @@ def fetch_enheter(page:int, size:int, kommunenummer_list):
         except requests.RequestException as e:
             last_err = (str(e), None, None)
 
-    # vis nyttig feilmelding i UI og stopp
     code, url, body = last_err if isinstance(last_err, tuple) else (None, None, None)
     st.error("Brreg-API avviste kallene. Sjekk detaljer under.")
     if url: st.code(f"URL: {url}")
     if code: st.code(f"Status: {code}")
     if body: st.code(body)
     st.stop()
-
 
 def normalize_enheter(payload):
     out = []
@@ -165,75 +165,68 @@ def normalize_enheter(payload):
         })
     return pd.DataFrame(out)
 
-# --- Roller ---
-ROLE_ENDPOINTS = [
-    "https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller",
-    "https://data.brreg.no/enhetsregisteret/api/roller/organisasjonsnummer/{orgnr}",
-    "https://data.brreg.no/enhetsregisteret/api/roller/enheter/{orgnr}",
-]
-
+# --- Roller (robust + historikk) ---
 @st.cache_data(show_spinner=False)
-def fetch_roles(orgnr:str):
-    for url in ROLE_ENDPOINTS:
+def fetch_roles(orgnr: str):
+    attempts = [
+        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller", {"includeHistorikk": "true"}),
+        ("https://data.brreg.no/enhetsregisteret/api/roller/organisasjonsnummer/{orgnr}", None),
+        ("https://data.brreg.no/enhetsregisteret/api/roller/enheter/{orgnr}", None),
+    ]
+    last = None
+    for url, params in attempts:
         try:
-            r = requests.get(url.format(orgnr=orgnr), timeout=TIMEOUT)
+            r = requests.get(url.format(orgnr=orgnr), params=params or {}, timeout=TIMEOUT, headers={"Accept": "application/json"})
             if r.status_code == 200 and "application/json" in r.headers.get("content-type", ""):
-                return r.json()
-        except requests.RequestException:
-            pass
-    return None
+                return {"_ok": True, "data": r.json(), "_url": r.url}
+            last = (r.status_code, r.url)
+        except requests.RequestException as e:
+            last = (str(e), url)
+    return {"_ok": False, "_error": last}
 
 def parse_roles(payload):
-    """Returner liste av dicts med navn, rolle (UPPER), fradato, tildato.
-    Tåler at rolle/type ikke er strenger (hopper over de)."""
+    """Trygg parser for ulike roller-responser."""
     rows = []
     if not isinstance(payload, (dict, list)):
         return rows
 
-    def walk(obj):
-        if isinstance(obj, dict):
-            # plukk ut kandidat for rolle/typetekst
-            role_raw = obj.get("rolle")
-            if not isinstance(role_raw, str):
-                role_raw = obj.get("type")
-            if not isinstance(role_raw, str):
-                role_raw = obj.get("rolletype")
-            role_str = role_raw if isinstance(role_raw, str) else None
-
-            # person/navn + datoer
-            person = obj.get("person") or {}
-            navn = person.get("navn") or obj.get("navn")
-            fradato = obj.get("fradato") or obj.get("registrertDato")
-            tildato = obj.get("tildato") or obj.get("avregistrertDato")
-
-            # bare legg til hvis vi faktisk har et navn og en ROLLE som tekst
-            if isinstance(navn, str) and role_str:
-                rows.append({
-                    "navn": navn,
-                    "rolle": role_str.upper(),
-                    "fradato": fradato,
-                    "tildato": tildato,
-                })
-
-            # gå videre rekursivt
-            for v in obj.values():
-                if isinstance(v, (dict, list)):
-                    walk(v)
-
-        elif isinstance(obj, list):
-            for v in obj:
-                if isinstance(v, (dict, list)):
-                    walk(v)
-
-    walk(payload)
+    # rask vei: rollegrupper -> roller
+    if isinstance(payload, dict) and "rollegrupper" in payload:
+        for g in payload.get("rollegrupper") or []:
+            for r in g.get("roller") or []:
+                navn = ((r.get("person") or {}).get("navn")) or r.get("navn")
+                role_raw = r.get("rolle") or r.get("type") or r.get("rolletype")
+                fradato = r.get("fradato") or r.get("registrertDato")
+                tildato = r.get("tildato") or r.get("avregistrertDato")
+                if isinstance(navn, str) and isinstance(role_raw, str):
+                    rows.append({"navn": navn, "rolle": role_raw.upper(), "fradato": fradato, "tildato": tildato})
+    else:
+        # generell dyp-gjennomgang
+        def walk(obj):
+            if isinstance(obj, dict):
+                role_raw = obj.get("rolle") or obj.get("type") or obj.get("rolletype")
+                role_str = role_raw if isinstance(role_raw, str) else None
+                person = obj.get("person") or {}
+                navn = person.get("navn") or obj.get("navn")
+                fradato = obj.get("fradato") or obj.get("registrertDato")
+                tildato = obj.get("tildato") or obj.get("avregistrertDato")
+                if isinstance(navn, str) and role_str:
+                    rows.append({"navn": navn, "rolle": role_str.upper(), "fradato": fradato, "tildato": tildato})
+                for v in obj.values():
+                    if isinstance(v, (dict, list)):
+                        walk(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    if isinstance(v, (dict, list)):
+                        walk(v)
+        walk(payload)
 
     # dedup
     seen, out = set(), []
     for r in rows:
         key = (r.get("navn"), r.get("rolle"), r.get("fradato"), r.get("tildato"))
         if key not in seen:
-            seen.add(key)
-            out.append(r)
+            seen.add(key); out.append(r)
     return out
 
 # --- Kjønn (automatisk når filter != Alle) ---
@@ -241,14 +234,14 @@ def parse_roles(payload):
 def genderize(first_name:str):
     try:
         resp = requests.get("https://api.genderize.io", params={"name": first_name}, timeout=10)
-        if resp.status_code == 200:
+        if resp.status_code == 200 and "application/json" in resp.headers.get("content-type",""):
             data = resp.json()
-            gen = data.get("gender"); prob = data.get("probability"); count = data.get("count")
+            gen = data.get("gender"); prob = data.get("probability")
             if gen in ("male", "female"):
-                return ("Mann" if gen == "male" else "Kvinne", prob, count)
+                return ("Mann" if gen == "male" else "Kvinne", prob)
     except requests.RequestException:
         pass
-    return ("Ukjent", None, None)
+    return ("Ukjent", None)
 
 def first_name_from_full(name:str):
     if not name: return ""
@@ -259,36 +252,29 @@ if run:
     kommunenr_manual = kommunenummer_list_from_text(kommunenr_raw)
     fylkepref = FYLKE_PREFIKS.get(fylke) if fylke != "(ingen)" else None
 
+    # Hent selskaper (med fallback på sort/size i fetch_enheter)
     all_pages = []
     page = 0
     total = None
-    try:
-        with st.spinner("Henter selskaper fra Enhetsregisteret..."):
-            while True:
-                payload = fetch_enheter(page, PAGE_SIZE, kommunenr_manual)
-                if total is None:
-                    total = (payload.get("page") or {}).get("totalElements", 0)
-                df_page = normalize_enheter(payload)
+    with st.spinner("Henter selskaper fra Enhetsregisteret..."):
+        while True:
+            payload = fetch_enheter(page, PAGE_SIZE, kommunenr_manual)
+            if total is None:
+                total = (payload.get("page") or {}).get("totalElements", 0)
+            df_page = normalize_enheter(payload)
 
-                # Lokal fylkefilter (prefiks på kommunenr)
-                if fylkepref:
-                    df_page = df_page[df_page["kommunenr"].fillna("").astype(str).str.startswith(fylkepref)]
-                # Segment/sektor lokalt
-                df_page = df_page[df_page.apply(lambda r: pass_segment_filter_row(r, seg_flags), axis=1)]
-                df_page = df_page[df_page.apply(lambda r: pass_sector_filter_row(r, sektor_priv, sektor_off), axis=1)]
+            if fylkepref:
+                df_page = df_page[df_page["kommunenr"].fillna("").astype(str).str.startswith(fylkepref)]
+            df_page = df_page[df_page.apply(lambda r: pass_segment_filter_row(r, seg_flags), axis=1)]
+            df_page = df_page[df_page.apply(lambda r: pass_sector_filter_row(r, sektor_priv, sektor_off), axis=1)]
 
-                all_pages.append(df_page)
-                page += 1
-                total_pages = (payload.get("page") or {}).get("totalPages", 1)
+            all_pages.append(df_page)
+            page += 1
+            total_pages = (payload.get("page") or {}).get("totalPages", 1)
 
-                # Siden API-et allerede er sortert etter ansatte desc kan vi stoppe
-                # så snart vi har > top_n (med litt margin)
-                have = pd.concat(all_pages).shape[0]
-                if have >= max(top_n * 2, top_n + 50) or page >= total_pages:
-                    break
-    except requests.HTTPError as e:
-        st.error("Feil fra Brreg-API (HTTPError). Prøv å justere filtre eller prøv igjen.")
-        st.stop()
+            have = pd.concat(all_pages).shape[0]
+            if have >= max(top_n * 2, top_n + 50) or page >= total_pages:
+                break
 
     companies_df = pd.concat(all_pages, ignore_index=True) if all_pages else pd.DataFrame()
     if not companies_df.empty:
@@ -299,39 +285,52 @@ if run:
 
     # Roller -> personer
     people_rows = []
+    showed_debug = False
     if not companies_top.empty:
         with st.spinner("Henter roller for topp-selskap..."):
             for _, row in companies_top.iterrows():
                 orgnr = str(row["orgnr"])
                 rp = fetch_roles(orgnr)
-                roles = parse_roles(rp)
+
+                if DEBUG_ROLES and not showed_debug:
+                    showed_debug = True
+                    if rp.get("_ok"):
+                        st.info(f"Debug: rolle-JSON for orgnr {orgnr}")
+                        st.json(rp["data"])
+                    else:
+                        st.warning(f"Rolle-endepunkt feilet for {orgnr}: {rp.get('_error')}")
+
+                payload = rp["data"] if rp.get("_ok") else {}
+                roles = parse_roles(payload)
+
                 for rr in roles:
-                    rolle_upper = (rr["rolle"] or "").upper()
+                    rolle_upper = (rr.get("rolle") or "")
                     active = not bool(rr.get("tildato"))
 
-                    # Rollefilter
+                    # Rollefilter m/garantert chosen_label
+                    chosen_label = rr.get("rolle") or "ROLLE"
                     keep = False
                     for ui_label, codes in role_map.items():
                         if role_flags[ui_label] and any(rolle_upper.startswith(c) for c in codes):
                             keep = True; chosen_label = ui_label; break
                     if not any(role_flags.values()):
-                        keep = True; chosen_label = rr["rolle"]
+                        keep = True  # ingen kryss = ta alt
+
                     if not keep or (active_only and not active):
                         continue
 
-                    # Kjønn-estimering slås kun på om filter != Alle
+                    # Kjønn-estimat kun hvis filter != Alle
                     est_gender = ""; gender_prob = None
                     if gender_filter != "Alle":
-                        first = first_name_from_full(rr["navn"])
-                        kjonn, prob, _ = genderize(first)
+                        first = first_name_from_full(rr.get("navn", ""))
+                        kjonn, prob = genderize(first)
                         est_gender, gender_prob = kjonn, prob
-                        # filtrer iht. valgt kjønn
                         target = {"Kvinne":"Kvinne","Mann":"Mann","Ukjent":"Ukjent"}[gender_filter]
                         if kjonn != target:
                             continue
 
                     people_rows.append({
-                        "Navn": rr["navn"],
+                        "Navn": rr.get("navn"),
                         "Estimert kjønn": est_gender,
                         "Kjønn sannsynlighet": gender_prob,
                         "Rolle": chosen_label,
@@ -390,4 +389,4 @@ if run:
         f"**Kjønnsfilter:** {gender_filter}"
     )
 
-st.caption("Kilde: Enhetsregisteret (åpne data). Roller hentes best-effort fra Brreg. Kjønn estimeres kun ved aktivt filter og er usikkert.")
+st.caption("Kilde: Enhetsregisteret (åpne data). Roller hentes best-effort fra Brreg (inkl. historikk). Kjønn estimeres kun ved aktivt filter og er usikkert.")
