@@ -1,4 +1,4 @@
-# app.py — Styrekandidat-screener (profilvisning + enkel bio)
+# app.py — Styrekandidat-screener (persistens + profil)
 import io
 import re
 from datetime import datetime, date
@@ -35,6 +35,16 @@ FYLKE_PREFIKS = {
     "Agder": "42", "Rogaland": "11", "Vestland": "46", "Møre og Romsdal": "15",
     "Trøndelag": "50", "Nordland": "18", "Troms": "19", "Finnmark": "20", "Buskerud": "33",
 }
+
+# init session state
+for k, v in {
+    "companies_top": None,
+    "people_df": None,
+    "last_filters": {},
+    "selected_person": "(ingen)",
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # --- Sidebar ---
 with st.sidebar:
@@ -131,7 +141,6 @@ def fetch_enheter(page:int, size:int, kommunenummer_list):
             last_err = (r.status_code, r.url, r.text[:800])
         except requests.RequestException as e:
             last_err = (str(e), None, None)
-
     code, url, body = last_err if isinstance(last_err, tuple) else (None, None, None)
     st.error("Brreg-API avviste kallene. Sjekk detaljer under.")
     if url: st.code(f"URL: {url}")
@@ -265,7 +274,6 @@ def first_name_from_full(name:str):
     if not name: return ""
     return re.split(r"\s+", name.strip())[0]
 
-# --- Datohjelpere for profil ---
 def _parse_date(s):
     if not s: return None
     for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y-%m", "%Y"):
@@ -288,7 +296,7 @@ def _duration_human(start:date|None, end:date|None):
         return f"{years} år"
     return f"{rem_m} mnd"
 
-# --- Run ---
+# --- RUN SEARCH ---
 if run:
     kommunenr_manual = kommunenummer_list_from_text(kommunenr_raw)
     fylkepref = FYLKE_PREFIKS.get(fylke) if fylke != "(ingen)" else None
@@ -296,12 +304,9 @@ if run:
     # Hent selskaper
     all_pages = []
     page = 0
-    total = None
     with st.spinner("Henter selskaper fra Enhetsregisteret..."):
         while True:
             payload = fetch_enheter(page, PAGE_SIZE, kommunenr_manual)
-            if total is None:
-                total = (payload.get("page") or {}).get("totalElements", 0)
             df_page = normalize_enheter(payload)
 
             if fylkepref:
@@ -329,34 +334,25 @@ if run:
     if not companies_top.empty:
         with st.spinner("Henter roller for topp-selskap..."):
             for _, row in companies_top.iterrows():
-                orgnr = str(row["orgnr"])
-                payload = fetch_roles(orgnr)
+                payload = fetch_roles(str(row["orgnr"]))
                 roles = parse_roles(payload)
-
                 for rr in roles:
                     rolle_code = (rr.get("rolle_kode") or "").upper()
                     rolle_text = (rr.get("rolle_tekst") or rolle_code)
                     now_active = (rr.get("tildato") in (None, "",)) and (rr.get("fratraadt") in (None, False))
 
                     # Rollefilter
-                    chosen_label = rolle_text  # fallback
+                    chosen_label = rolle_text
                     keep = False
                     for ui_label, codes in role_map.items():
                         if role_flags[ui_label] and any(rolle_code.startswith(c) for c in codes):
-                            keep = True
-                            chosen_label = ui_label
-                            break
+                            keep = True; chosen_label = ui_label; break
                     if not any(role_flags.values()):
-                        keep = True  # ingen kryss = ta alt
+                        keep = True
                     if not keep or (active_only and not now_active):
                         continue
 
-                    # Kjønn-estimat (alltid vist)
                     kjonn = genderize(first_name_from_full(rr.get("navn", "")))
-                    # Filter hvis valgt
-                    if gender_filter != "Alle" and kjonn != gender_filter:
-                        continue
-
                     people_rows.append({
                         "Navn": rr.get("navn"),
                         "Kjønn": kjonn,
@@ -366,23 +362,43 @@ if run:
                         "Industri": row["segmenter"],
                         "Sektor": row["sektor"],
                         "Nåværende": bool(now_active),
-                        # beholder rådatoer skjult for profil-beregning:
                         "_start": rr.get("fradato"),
                         "_slutt": rr.get("tildato"),
-                        "Brreg-lenke": f"https://w2.brreg.no/enhet/sok/detalj.jsp?orgnr={orgnr}",
+                        "Brreg-lenke": f"https://w2.brreg.no/enhet/sok/detalj.jsp?orgnr={row['orgnr']}",
                     })
 
-    people_df = pd.DataFrame(people_rows)
+    people_df_all = pd.DataFrame(people_rows)
 
-    # --- Output: Selskaper ---
+    # Lagre i session_state
+    st.session_state.companies_top = companies_top
+    st.session_state.people_df = people_df_all
+    st.session_state.last_filters = {
+        "sektor_priv": sektor_priv,
+        "sektor_off": sektor_off,
+        "gender_filter": gender_filter,
+        "top_n": int(top_n),
+    }
+    # reset valgt person når nytt søk kjøres
+    st.session_state.selected_person = "(ingen)"
+
+# --- RENDER (bruk session_state hvis data finnes) ---
+companies_top = st.session_state.companies_top
+people_df_all = st.session_state.people_df
+last = st.session_state.last_filters
+
+if companies_top is not None and people_df_all is not None:
+    # Selskaper
     st.subheader("Selskaper")
     if not companies_top.empty:
-        out_companies = companies_top[["navn","orgnr","kommune","ansatte","segmenter","sektor","hjemmeside"]].rename(columns={
+        out_companies = companies_top[
+            ["navn","orgnr","kommune","ansatte","segmenter","sektor","hjemmeside"]
+        ].rename(columns={
             "navn":"Selskapsnavn","orgnr":"Orgnr","kommune":"Kommune","ansatte":"Ansatte",
             "segmenter":"Industri","sektor":"Sektor","hjemmeside":"Nettside",
         })
         st.dataframe(out_companies, width="stretch", hide_index=True)
-        st.download_button("⬇️ Last ned selskaper (CSV)", data=out_companies.to_csv(index=False).encode("utf-8"),
+        st.download_button("⬇️ Last ned selskaper (CSV)",
+                           data=out_companies.to_csv(index=False).encode("utf-8"),
                            file_name="companies_top.csv", mime="text/csv")
         xbuf = io.BytesIO()
         with pd.ExcelWriter(xbuf, engine="xlsxwriter") as w:
@@ -393,15 +409,18 @@ if run:
     else:
         st.info("Ingen selskaper funnet med gjeldende filtre.")
 
-    # --- Output: Personer ---
+    # Personer (apply kjønnsfilter ved visning)
     st.subheader("Personer (roller i topp-selskap)")
+    people_df = people_df_all.copy()
+    gf = last.get("gender_filter", "Alle")
+    if gf != "Alle":
+        people_df = people_df[people_df["Kjønn"] == gf]
+
     if not people_df.empty:
-        # Vis tabell
         visible_people = people_df.drop(columns=["_start","_slutt"], errors="ignore")
         st.dataframe(visible_people, width="stretch", hide_index=True)
-
-        # Nedlasting
-        st.download_button("⬇️ Last ned personer (CSV)", data=visible_people.to_csv(index=False).encode("utf-8"),
+        st.download_button("⬇️ Last ned personer (CSV)",
+                           data=visible_people.to_csv(index=False).encode("utf-8"),
                            file_name="people_roles.csv", mime="text/csv")
         xbuf2 = io.BytesIO()
         with pd.ExcelWriter(xbuf2, engine="xlsxwriter") as w:
@@ -410,26 +429,23 @@ if run:
                            file_name="people_roles.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        # --- Mini-profil for valgt person (fra dette uttrekket) ---
+        # Mini-profil
         uniq = sorted(people_df["Navn"].dropna().unique().tolist())
-        pick = st.selectbox("Vis profil for person:", options=["(ingen)"] + uniq, index=0)
+        pick = st.selectbox("Vis profil for person:", options=["(ingen)"] + uniq,
+                            index=(["(ingen)"]+uniq).index(st.session_state.selected_person) if st.session_state.selected_person in ["(ingen)"]+uniq else 0,
+                            key="selected_person")
         if pick != "(ingen)":
-            prof = people_df[people_df["Navn"] == pick].copy()
-
-            # beregn ansiennitet pr. rad
+            prof = people_df_all[people_df_all["Navn"] == pick].copy()  # bruk ALL (ikke kjønnsfiltrert) for full historikk
             prof["Start_d"] = prof["_start"].apply(_parse_date)
             prof["Slutt_d"] = prof["_slutt"].apply(_parse_date)
             prof["Ansiennitet"] = prof.apply(lambda r: _duration_human(r["Start_d"], r["Slutt_d"]), axis=1)
 
-            # sammendrag
             ant_roller = len(prof)
             ant_aktive = int(prof["Nåværende"].sum())
-            selskaper = sorted(prof["Selskap"].dropna().unique().tolist())
+            rollelabels = sorted(prof["Rolle"].dropna().unique().tolist())
             bransjer = sorted({b for s in prof["Industri"].fillna("").tolist() for b in (s.split(", ") if s else []) if b})
             sektorer = sorted(prof["Sektor"].dropna().unique().tolist())
 
-            # enkel bio (deterministisk, ingen LLM)
-            rollelabels = sorted(prof["Rolle"].dropna().unique().tolist())
             bio_lines = [
                 f"{pick} har {ant_roller} registrerte roller i dette uttrekket ({ant_aktive} aktive).",
                 f"Typiske roller: {', '.join(rollelabels)}." if rollelabels else "",
@@ -437,27 +453,26 @@ if run:
                 f"Sektor: {', '.join(sektorer)}." if sektorer else "",
             ]
             bio = " ".join([s for s in bio_lines if s])
-
             st.markdown(f"**Profil – {pick}**")
             if bio:
                 st.write(bio)
 
-            # rolle-tabell (kompakt)
             show_prof = prof[[
                 "Rolle","Selskap","Industri","Sektor","Nåværende","_start","_slutt","Ansiennitet","Brreg-lenke"
-            ]].rename(columns={"_start":"Start", "_slutt":"Slutt"})
+            ]].rename(columns={"_start":"Start","_slutt":"Slutt"})
             st.dataframe(show_prof, width="stretch", hide_index=True)
-
     else:
         st.info("Ingen personer/roller funnet i topp-selskapene.")
 
-    # --- Status (faktiske tall) ---
+    # Status
     st.markdown(
-        f"**Antall selskaper vist:** {len(companies_top):,} • "
-        f"**Antall personer vist:** {len(people_df):,} • "
+        f"**Antall selskaper vist:** {0 if companies_top is None else len(companies_top):,} • "
+        f"**Antall personer vist:** {len(people_df) if 'people_df' in locals() else 0:,} • "
         f"**Sektorfilter:** "
-        f"{'Privat' if sektor_priv else ''}{'/' if (sektor_priv and sektor_off) else ''}{'Offentlig' if sektor_off else ''} • "
-        f"**Kjønnsfilter:** {gender_filter}"
+        f"{'Privat' if last.get('sektor_priv', True) else ''}{'/' if (last.get('sektor_priv', True) and last.get('sektor_off', True)) else ''}{'Offentlig' if last.get('sektor_off', True) else ''} • "
+        f"**Kjønnsfilter:** {last.get('gender_filter','Alle')}"
     )
+else:
+    st.info("Kjør et søk fra venstremenyen for å vise resultater.")
 
 st.caption("Kilde: Enhetsregisteret (åpne data). Roller hentes best-effort fra Brreg (inkl. historikk). Kjønn estimeres fra fornavn og er usikkert.")
