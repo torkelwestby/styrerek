@@ -7,6 +7,13 @@ import requests
 import pandas as pd
 import streamlit as st
 
+import html
+try:
+    import feedparser  # for RSS fallback
+except Exception:
+    feedparser = None
+
+
 ENHETS_API = "https://data.brreg.no/enhetsregisteret/api/enheter"
 PAGE_SIZE = 200
 TIMEOUT = 30
@@ -274,6 +281,98 @@ def first_name_from_full(name:str):
     if not name: return ""
     return re.split(r"\s+", name.strip())[0]
 
+# --- Media mentions: NewsAPI -> GDELT -> RSS ---
+FEEDS = [
+    "https://www.nrk.no/toppsaker.rss",
+    "https://e24.no/rss",
+    "https://www.dn.no/rss",
+    "https://www.hegnar.no/rss",  # valgfritt
+]
+
+def search_mentions_newsapi(person_name: str, page_size: int = 8):
+    key = st.secrets.get("NEWSAPI_KEY", "")
+    if not key:
+        return []
+    url = "https://newsapi.org/v2/everything"
+    params = {
+        "q": person_name,
+        "language": "no",
+        "pageSize": page_size,
+        "sortBy": "publishedAt",
+        "apiKey": key,
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        return [
+            {
+                "title": a.get("title"),
+                "url": a.get("url"),
+                "source": (a.get("source") or {}).get("name"),
+                "date": a.get("publishedAt"),
+                "source_type": "NewsAPI",
+            }
+            for a in data.get("articles", [])
+        ]
+    except Exception:
+        return []
+
+def search_mentions_gdelt(person_name: str, maxrecords: int = 8):
+    url = "https://api.gdeltproject.org/api/v2/doc/doc"
+    params = {"query": f"{person_name} sourceCountry:NO", "mode": "ArtList", "maxrecords": maxrecords, "format": "json"}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        arts = data.get("articles", [])
+        return [
+            {
+                "title": a.get("title"),
+                "url": a.get("url"),
+                "source": a.get("sourceCommonName"),
+                "date": a.get("seendate"),
+                "source_type": "GDELT",
+            }
+            for a in arts
+        ]
+    except Exception:
+        return []
+
+def search_mentions_rss(person_name: str, limit_per_feed: int = 15):
+    if not feedparser:
+        return []
+    out = []
+    q = (person_name or "").lower()
+    try:
+        for f in FEEDS:
+            d = feedparser.parse(f)
+            src = d.feed.get("title", "")
+            for e in d.entries[:limit_per_feed]:
+                text = " ".join([e.get("title",""), html.unescape(e.get("summary",""))])
+                if q and q in text.lower():
+                    out.append({
+                        "title": e.get("title",""),
+                        "url": e.get("link",""),
+                        "source": src,
+                        "date": e.get("published","") or e.get("updated",""),
+                        "source_type": "RSS",
+                    })
+    except Exception:
+        pass
+    return out
+
+def search_mentions(person_name: str) -> list[dict]:
+    # 1) NewsAPI (hvis nøkkel finnes)  2) GDELT  3) RSS
+    res = search_mentions_newsapi(person_name)
+    if res:
+        return res
+    res = search_mentions_gdelt(person_name)
+    if res:
+        return res
+    return search_mentions_rss(person_name)
+
+
 def _parse_date(s):
     if not s: return None
     for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y-%m", "%Y"):
@@ -479,14 +578,21 @@ if companies_top is not None and people_df_all is not None:
             ]].rename(columns={"_start":"Start","_slutt":"Slutt"})
             st.dataframe(show_prof, width="stretch", hide_index=True)
 
-            # Valgfri medieomtale (kun hvis BING_KEY er satt)
-            hits = search_mentions(pick, company=prof["Selskap"].iloc[0] if not prof.empty else None, limit=5)
-            with st.expander("Medieomtale (siste mnd)", expanded=False):
-                if hits:
-                    for h in hits:
-                        st.markdown(f"- [{h['title']}]({h['url']}) — {h['snippet']}")
-                else:
-                    st.caption("Legg til en miljøvariabel BING_KEY for å aktivere enkle web-treff (eller ingen treff funnet).")
+            # Media-treff for valgt person (fallback-kjede)
+            mentions = search_mentions(pick)
+            if mentions:
+                st.markdown("**Nevnt i media:**")
+                for m in mentions:
+                    title = m.get("title") or "(uten tittel)"
+                    url = m.get("url") or ""
+                    source = m.get("source") or ""
+                    date = m.get("date") or ""
+                    src_tag = m.get("source_type")
+                    st.markdown(f"- [{title}]({url}) — {source} {('• ' + date) if date else ''}  \n  <sub>via {src_tag}</sub>", unsafe_allow_html=True)
+            else:
+                st.caption("Ingen medietreff funnet (NewsAPI/GDELT/RSS).")
+
+
     else:
         st.info("Ingen personer/roller funnet i topp-selskapene.")
 
