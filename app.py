@@ -181,29 +181,36 @@ def normalize_enheter(payload):
 
 # --- Roller (robust + historikk) ---
 @st.cache_data(show_spinner=False)
+# --- Roller (robust + historikk) ---
+@st.cache_data(show_spinner=False)
 def fetch_roles(orgnr: str):
     attempts = [
-        # Samme endepunkt, flere mulige parameternavn for historikk
-        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller", {"includeHistorikk": "true"}),
-        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller", {"inkluderHistorikk": "true"}),
-        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller", {"historikk": "true"}),
-        # Alternative (eldre) ruter
-        ("https://data.brreg.no/enhetsregisteret/api/roller/organisasjonsnummer/{orgnr}", {"inkluderHistorikk": "true"}),
-        ("https://data.brreg.no/enhetsregisteret/api/roller/enheter/{orgnr}", {"inkluderHistorikk": "true"}),
+        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller",
+         {"includeHistorikk": "true"}),
+        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller",
+         {"inkluderHistorikk": "true"}),
+        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller",
+         {"historikk": "true"}),
+        ("https://data.brreg.no/enhetsregisteret/api/roller/organisasjonsnummer/{orgnr}",
+         {"inkluderHistorikk": "true"}),
+        ("https://data.brreg.no/enhetsregisteret/api/roller/enheter/{orgnr}",
+         {"inkluderHistorikk": "true"}),
     ]
+    headers = {"Accept": "application/json", "Accept-Language": "nb-NO"}
     for url, params in attempts:
         try:
-            r = requests.get(
-                url.format(orgnr=orgnr),
-                params=params,
-                timeout=TIMEOUT,
-                headers={"Accept": "application/json"}
-            )
-            if r.status_code == 200 and "application/json" in r.headers.get("content-type",""):
+            r = requests.get(url.format(orgnr=orgnr), params=params, timeout=TIMEOUT, headers=headers)
+            if r.status_code == 200 and "application/json" in r.headers.get("content-type", ""):
                 return r.json()
         except requests.RequestException:
             pass
     return None
+
+def is_now_active(role_dict: dict) -> bool:
+    """Aktiv hvis ingen tildato OG ikke fratrådt."""
+    tildato = role_dict.get("tildato")
+    fratraadt = role_dict.get("fratraadt")
+    return (tildato in (None, "",)) and (fratraadt in (None, False))
 
 def _join_name(n):
     if isinstance(n, str):
@@ -266,6 +273,7 @@ def parse_roles(payload):
         if key not in seen:
             seen.add(key); out.append(r)
     return out
+
 
 # --- Kjønn (alltid vist; filter valgfritt) ---
 @st.cache_data(show_spinner=False)
