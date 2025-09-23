@@ -1,4 +1,4 @@
-# app.py — Styrekandidat-screener (persistens + profil + medieomtale, historikk-fix)
+# app.py — Styrekandidat-screener (historikk + persistens + profil + medieomtale)
 import io
 import os
 import re
@@ -85,13 +85,7 @@ with st.sidebar:
     gender_filter = st.radio("Kjønnsfilter (estimat fra fornavn)", options=["Alle", "Dame", "Mann"], index=0, horizontal=True)
 
     st.divider()
-    col_a, col_b = st.columns(2)
-    with col_a:
-        run = st.button("Kjør søk", type="primary")
-    with col_b:
-        if st.button("Tøm cache"):
-            st.cache_data.clear()
-            st.experimental_rerun()
+    run = st.button("Kjør søk", type="primary")
 
 # --- Helpers ---
 def kommunenummer_list_from_text(txt:str):
@@ -185,33 +179,64 @@ def normalize_enheter(payload):
         })
     return pd.DataFrame(out)
 
-# --- Roller (robust + historikk) ---
+# --- Roller (robust: historikk via param + _links + søkeendepunkt) ---
 @st.cache_data(show_spinner=False)
 def fetch_roles(orgnr: str):
-    attempts = [
-        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller",
-         {"includeHistorikk": "true"}),
-        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller",
-         {"inkluderHistorikk": "true"}),
-        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller",
-         {"historikk": "true"}),
-        ("https://data.brreg.no/enhetsregisteret/api/roller/organisasjonsnummer/{orgnr}",
-         {"inkluderHistorikk": "true"}),
-        ("https://data.brreg.no/enhetsregisteret/api/roller/enheter/{orgnr}",
-         {"inkluderHistorikk": "true"}),
-    ]
     headers = {"Accept": "application/json", "Accept-Language": "nb-NO"}
-    for url, params in attempts:
+
+    def _get(url, params=None):
         try:
-            r = requests.get(url.format(orgnr=orgnr), params=params, timeout=TIMEOUT, headers=headers)
+            r = requests.get(url, params=params or {}, timeout=TIMEOUT, headers=headers)
             if r.status_code == 200 and "application/json" in r.headers.get("content-type", ""):
                 return r.json()
         except requests.RequestException:
             pass
+        return None
+
+    # Hovedforsøk: enhetens roller med historikk-parameter (flere varianter)
+    attempts = [
+        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller", {"includeHistorikk": "true"}),
+        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller", {"inkluderHistorikk": "true"}),
+        ("https://data.brreg.no/enhetsregisteret/api/enheter/{orgnr}/roller", {"historikk": "true"}),
+    ]
+    for url, params in attempts:
+        data = _get(url.format(orgnr=orgnr), params)
+        if data:
+            # Se om API-et eksponerer eksplisitt historikk-lenke
+            hist = None
+            try:
+                hist_link = (((data or {}).get("_links") or {}).get("historikk") or {}).get("href")
+                if hist_link:
+                    hist = _get(hist_link)
+            except Exception:
+                hist = None
+            if hist:
+                return {"_merged": True, "rolledata": data, "historikk": hist}
+            return data
+
+    # Fallback: søkeendepunkt /api/roller?organisasjonsnummer=... med historikk-parameter
+    attempts2 = [
+        ("https://data.brreg.no/enhetsregisteret/api/roller", {"organisasjonsnummer": orgnr, "includeHistorikk": "true"}),
+        ("https://data.brreg.no/enhetsregisteret/api/roller", {"organisasjonsnummer": orgnr, "inkluderHistorikk": "true"}),
+    ]
+    for url, params in attempts2:
+        data = _get(url, params)
+        if data:
+            return data
+
+    # Siste fallback: gamle varianter uten param
+    attempts3 = [
+        ("https://data.brreg.no/enhetsregisteret/api/roller/organisasjonsnummer/{orgnr}", None),
+        ("https://data.brreg.no/enhetsregisteret/api/roller/enheter/{orgnr}", None),
+    ]
+    for url, params in attempts3:
+        data = _get(url.format(orgnr=orgnr), params)
+        if data:
+            return data
+
     return None
 
 def is_now_active(role_dict: dict) -> bool:
-    """Aktiv hvis ingen tildato OG ikke fratrådt."""
     tildato = role_dict.get("tildato")
     fratraadt = role_dict.get("fratraadt")
     return (tildato in (None, "",)) and (fratraadt in (None, False))
@@ -233,10 +258,25 @@ def _role_to_text_and_code(r):
     return "", ""
 
 def parse_roles(payload):
-    """Trekk ut både aktive og historiske roller uansett hvor i JSON de ligger."""
     rows = []
     if not isinstance(payload, (dict, list)):
         return rows
+
+    # Sammenslått struktur fra fetch_roles (aktuell + historikk)
+    if isinstance(payload, dict) and payload.get("_merged"):
+        base = payload.get("rolledata")
+        hist = payload.get("historikk")
+        if base:
+            rows.extend(parse_roles(base))
+        if hist:
+            rows.extend(parse_roles(hist))
+        # dedup
+        seen, out = set(), []
+        for r in rows:
+            key = (r.get("navn"), r.get("rolle_kode"), r.get("fradato"), r.get("tildato"))
+            if key not in seen:
+                seen.add(key); out.append(r)
+        return out
 
     def add_from_r(r):
         navn = _join_name(((r.get("person") or {}).get("navn")) or r.get("navn"))
@@ -254,28 +294,23 @@ def parse_roles(payload):
                 "fratraadt": fratraadt,
             })
 
-    # 1) Les eksplisitte rollegrupper (typisk aktive)
     if isinstance(payload, dict) and "rollegrupper" in payload:
         for g in payload.get("rollegrupper") or []:
             for r in g.get("roller") or []:
                 add_from_r(r)
-
-    # 2) Skann hele payload for alt som *kan* se ut som roller (inkl. historikkfelter)
-    def walk(obj):
-        if isinstance(obj, dict):
-            # nøkler som ofte rommer historikk
-            for key in ("historikk", "historiskeRoller", "tidligereRoller", "roller", "rolle", "rolletype", "type"):
-                if key in obj:
+    else:
+        def walk(obj):
+            if isinstance(obj, dict):
+                if "person" in obj or "rolle" in obj or "rolletype" in obj or "type" in obj:
                     add_from_r(obj)
-                    break
-            for v in obj.values():
-                if isinstance(v, (dict, list)):
-                    walk(v)
-        elif isinstance(obj, list):
-            for v in obj:
-                if isinstance(v, (dict, list)):
-                    walk(v)
-    walk(payload)
+                for v in obj.values():
+                    if isinstance(v, (dict, list)):
+                        walk(v)
+            elif isinstance(obj, list):
+                for v in obj:
+                    if isinstance(v, (dict, list)):
+                        walk(v)
+        walk(payload)
 
     # dedup
     seen, out = set(), []
@@ -466,7 +501,7 @@ if run:
     else:
         companies_top = pd.DataFrame()
 
-    # Roller -> personer (ALLTID hent alle roller; filtrer 'aktive' etterpå basert på active_only)
+    # Roller -> personer
     people_rows = []
     if not companies_top.empty:
         with st.spinner("Henter roller for topp-selskap..."):
@@ -486,10 +521,9 @@ if run:
                             keep = True; chosen_label = ui_label; break
                     if not any(role_flags.values()):
                         keep = True
+                    # Aktiv-filter (hvis aktiv kun --> behold kun aktive; ellers ta alt)
                     if not keep:
                         continue
-
-                    # Aktiv-filter (GJØRES NÅ, etter at alle roller er hentet)
                     if active_only and not now_active:
                         continue
 
@@ -539,13 +573,12 @@ def build_full_profile_for_person(name: str, companies_top_df: pd.DataFrame) -> 
         for rr in roles:
             n = (rr.get("navn") or "").strip()
             if n.lower() == name.strip().lower():
-                now_active = is_now_active(rr)
                 rows.append({
                     "Rolle": rr.get("rolle_tekst") or rr.get("rolle_kode"),
                     "Selskap": c["navn"],
                     "Industri": c["segmenter"],
                     "Sektor": c["sektor"],
-                    "Nåværende": bool(now_active),
+                    "Nåværende": bool(is_now_active(rr)),
                     "_start": rr.get("fradato"),
                     "_slutt": rr.get("tildato"),
                     "Brreg-lenke": f"https://w2.brreg.no/enhet/sok/detalj.jsp?orgnr={c['orgnr']}",
@@ -604,13 +637,14 @@ if companies_top is not None and people_df_all is not None:
         if pick != "(ingen)":
             prof = build_full_profile_for_person(pick, companies_top)
             if prof.empty:
+                # fallback: det som finnes i uttrekket
                 prof = people_df_all[people_df_all["Navn"] == pick][[
                     "Rolle","Selskap","Industri","Sektor","Nåværende","_start","_slutt","Brreg-lenke"
                 ]].copy()
 
             # dato/ansiennitet
-            prof["Start_d"] = prof["_start"].apply(_parse_date)
-            prof["Slutt_d"] = prof["_slutt"].apply(_parse_date)
+            prof["Start_d"] = prof["_start"].apply(lambda s: _parse_date(s))
+            prof["Slutt_d"] = prof["_slutt"].apply(lambda s: _parse_date(s))
             prof["Ansiennitet"] = prof.apply(lambda r: _duration_human(r["Start_d"], r["Slutt_d"]), axis=1)
 
             ant_roller = len(prof)
@@ -664,4 +698,4 @@ if companies_top is not None and people_df_all is not None:
 else:
     st.info("Kjør et søk fra venstremenyen for å vise resultater.")
 
-st.caption("Kilde: Enhetsregisteret (åpne data). Roller hentes best-effort fra Brreg (inkl. historikk). Kjønn estimeres fra fornavn og er usikkert. Medieomtale er valgfri (NewsAPI/GDELT/RSS).")
+st.caption("Kilde: Enhetsregisteret (åpne data). Roller hentes best-effort fra Brreg (inkl. historikk når tilgjengelig). Kjønn estimeres fra fornavn og er usikkert. Medieomtale er valgfri (NewsAPI/GDELT/RSS).")
